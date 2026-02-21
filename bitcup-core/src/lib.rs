@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::OsRng;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use secrecy::{ExposeSecret, SecretString};
+use zeroize::Zeroizing;
 
 const MAGIC: [u8; 4] = *b"BCUP";
 pub const ENVELOPE_VERSION: u16 = 1;
@@ -349,6 +351,7 @@ pub enum SigningError {
     InvalidOid,
     InvalidPublicKey,
     InvalidSignature,
+    InvalidSecretKey,
     VerificationFailed,
 }
 
@@ -358,6 +361,7 @@ impl fmt::Display for SigningError {
             Self::InvalidOid => write!(f, "invalid oid hex"),
             Self::InvalidPublicKey => write!(f, "invalid public key bytes"),
             Self::InvalidSignature => write!(f, "invalid signature bytes"),
+            Self::InvalidSecretKey => write!(f, "invalid secret key bytes"),
             Self::VerificationFailed => write!(f, "signature verification failed"),
         }
     }
@@ -367,6 +371,30 @@ impl std::error::Error for SigningError {}
 
 pub fn generate_signing_key() -> SigningKey {
     SigningKey::generate(&mut OsRng)
+}
+
+pub fn signing_key_from_secret_hex(secret_hex: &str) -> Result<SigningKey, SigningError> {
+    let bytes = decode_hex_32(secret_hex).ok_or(SigningError::InvalidSecretKey)?;
+    Ok(SigningKey::from_bytes(&bytes))
+}
+
+pub fn sign_commit_oid_with_secret_hex(
+    oid_hex: &str,
+    secret_hex: &str,
+) -> Result<CommitSignature, SigningError> {
+    let secret = SecretString::new(secret_hex.to_owned().into());
+    let key = signing_key_from_secret_string(&secret)?;
+    sign_commit_oid(oid_hex, &key)
+}
+
+pub fn signing_key_from_secret_string(
+    secret_hex: &SecretString,
+) -> Result<SigningKey, SigningError> {
+    let bytes = Zeroizing::new(
+        decode_hex_32(secret_hex.expose_secret()).ok_or(SigningError::InvalidSecretKey)?,
+    );
+    let key = SigningKey::from_bytes(&bytes);
+    Ok(key)
 }
 
 pub fn sign_commit_oid(oid_hex: &str, key: &SigningKey) -> Result<CommitSignature, SigningError> {
@@ -484,6 +512,19 @@ fn detect_file_mode(path: &Path) -> Result<u32, SnapshotError> {
 
 fn is_valid_oid_hex(input: &str) -> bool {
     input.len() == 64 && input.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+}
+
+fn decode_hex_32(input: &str) -> Option<[u8; 32]> {
+    if input.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in input.as_bytes().chunks_exact(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)? as u8;
+        let lo = (chunk[1] as char).to_digit(16)? as u8;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -781,5 +822,22 @@ mod tests {
         let key = generate_signing_key();
         let err = sign_commit_oid("not-oid", &key).expect_err("must fail");
         assert_eq!(err, SigningError::InvalidOid);
+    }
+
+    #[test]
+    fn signing_key_from_secret_hex_roundtrip() {
+        let secret = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+        let key = signing_key_from_secret_hex(secret).expect("parse secret");
+        let oid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let sig = sign_commit_oid(oid, &key).expect("sign");
+        verify_commit_oid_signature(oid, &sig).expect("verify");
+    }
+
+    #[test]
+    fn sign_commit_oid_with_secret_hex_roundtrip() {
+        let secret = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sig = sign_commit_oid_with_secret_hex(oid, secret).expect("sign");
+        verify_commit_oid_signature(oid, &sig).expect("verify");
     }
 }

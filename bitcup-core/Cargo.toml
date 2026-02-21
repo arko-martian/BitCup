@@ -10,6 +10,8 @@ bytecheck = { workspace = true }
 ignore = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
+secrecy = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

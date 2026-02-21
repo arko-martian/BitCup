@@ -3,11 +3,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use bitcup_core::{
-    ObjectKind, create_commit, decode_blob, decode_commit, decode_tree, snapshot_tree,
+    ObjectKind, create_commit, decode_blob, decode_commit, decode_tree,
+    sign_commit_oid_with_secret_hex, snapshot_tree,
 };
 use bitcup_store::{
-    VerifyOptions, init_repo, open_repo, read_object, read_ref, update_ref, verify_repo,
-    write_object,
+    RefSignaturePolicy, VerifyOptions, init_repo, open_repo, read_object, read_ref, update_ref,
+    update_ref_signed, verify_repo, write_object,
 };
 use clap::{Parser, Subcommand};
 
@@ -28,6 +29,10 @@ enum Commands {
         message: String,
         #[arg(short, long, default_value = "BitCup User <user@local>")]
         author: String,
+        #[arg(long)]
+        sign: bool,
+        #[arg(long)]
+        signing_key: Option<String>,
     },
     Log,
     Show {
@@ -36,6 +41,8 @@ enum Commands {
     Verify {
         #[arg(long)]
         rebuild_index: bool,
+        #[arg(long)]
+        require_signed_refs: bool,
     },
 }
 
@@ -46,10 +53,18 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Init => cmd_init(cwd),
         Commands::Snapshot => cmd_snapshot(cwd),
-        Commands::Commit { message, author } => cmd_commit(cwd, &message, &author),
+        Commands::Commit {
+            message,
+            author,
+            sign,
+            signing_key,
+        } => cmd_commit(cwd, &message, &author, sign, signing_key),
         Commands::Log => cmd_log(cwd),
         Commands::Show { oid } => cmd_show(cwd, &oid),
-        Commands::Verify { rebuild_index } => cmd_verify(cwd, rebuild_index),
+        Commands::Verify {
+            rebuild_index,
+            require_signed_refs,
+        } => cmd_verify(cwd, rebuild_index, require_signed_refs),
     }
 }
 
@@ -73,7 +88,13 @@ fn cmd_snapshot(root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_commit(root: PathBuf, message: &str, author: &str) -> Result<()> {
+fn cmd_commit(
+    root: PathBuf,
+    message: &str,
+    author: &str,
+    sign: bool,
+    signing_key: Option<String>,
+) -> Result<()> {
     let layout =
         open_repo(&root).with_context(|| format!("failed to open repo at {}", root.display()))?;
     let snapshot = snapshot_tree(&root).context("failed to snapshot working tree")?;
@@ -92,8 +113,32 @@ fn cmd_commit(root: PathBuf, message: &str, author: &str) -> Result<()> {
     let commit = create_commit(&tree_oid.to_string(), &parents, author, author, message, ts)
         .context("failed to build commit object")?;
     let commit_oid = write_object(&layout, &commit).context("failed to write commit object")?;
-    update_ref(&layout, &head_ref, &commit_oid.to_string())
-        .context("failed to update branch ref")?;
+    let commit_oid_hex = commit_oid.to_string();
+    if sign {
+        let secret_hex = signing_key
+            .or_else(|| std::env::var("BITCUP_SIGNING_KEY_HEX").ok())
+            .context("missing signing key: set --signing-key or BITCUP_SIGNING_KEY_HEX")?;
+        let signature = sign_commit_oid_with_secret_hex(&commit_oid_hex, &secret_hex)
+            .context("failed to sign commit oid")?;
+        update_ref_signed(
+            &layout,
+            &head_ref,
+            &commit_oid_hex,
+            Some(&signature),
+            RefSignaturePolicy::RequireValidSignature,
+        )
+        .context("failed to update signed branch ref")?;
+        println!(
+            "signed-ref-pubkey {}",
+            signature
+                .public_key
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
+    } else {
+        update_ref(&layout, &head_ref, &commit_oid_hex).context("failed to update branch ref")?;
+    }
 
     println!("commit {}", commit_oid);
     println!("tree   {}", tree_oid);
@@ -181,15 +226,22 @@ fn cmd_show(root: PathBuf, oid: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_verify(root: PathBuf, rebuild_index: bool) -> Result<()> {
+fn cmd_verify(root: PathBuf, rebuild_index: bool, require_signed_refs: bool) -> Result<()> {
     let layout =
         open_repo(&root).with_context(|| format!("failed to open repo at {}", root.display()))?;
-    let report =
-        verify_repo(&layout, VerifyOptions { rebuild_index }).context("verification failed")?;
+    let report = verify_repo(
+        &layout,
+        VerifyOptions {
+            rebuild_index,
+            require_signed_refs,
+        },
+    )
+    .context("verification failed")?;
     println!("verify ok");
     println!("objects: {}", report.object_count);
     println!("refs: {}", report.ref_count);
     println!("rebuild_index: {}", rebuild_index);
+    println!("require_signed_refs: {}", require_signed_refs);
     Ok(())
 }
 

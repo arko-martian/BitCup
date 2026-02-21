@@ -2,7 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use bitcup_core::{ObjectEnvelope, ObjectId};
+use bitcup_core::{CommitSignature, ObjectEnvelope, ObjectId, verify_commit_oid_signature};
 use fd_lock::RwLock;
 use redb::{Database, TableDefinition};
 use tempfile::NamedTempFile;
@@ -78,6 +78,10 @@ pub enum RefUpdateError {
     },
     #[error("lock error: {0}")]
     Lock(String),
+    #[error("signature required by policy")]
+    SignatureRequired,
+    #[error("invalid ref signature: {0}")]
+    InvalidSignature(String),
 }
 
 #[derive(Debug, Error)]
@@ -97,6 +101,7 @@ pub enum ObjectStoreError {
 #[derive(Debug, Clone, Copy)]
 pub struct VerifyOptions {
     pub rebuild_index: bool,
+    pub require_signed_refs: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -131,6 +136,16 @@ pub enum VerifyError {
     MissingRefObject { ref_name: String, oid: String },
     #[error("metadata error: {0}")]
     Metadata(String),
+    #[error("missing signature for ref {ref_name}")]
+    MissingRefSignature { ref_name: String },
+    #[error("invalid signature for ref {ref_name}: {message}")]
+    InvalidRefSignature { ref_name: String, message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefSignaturePolicy {
+    Optional,
+    RequireValidSignature,
 }
 
 pub fn init_repo(root: impl AsRef<Path>) -> Result<RepoLayout, InitRepoError> {
@@ -147,6 +162,7 @@ pub fn init_repo(root: impl AsRef<Path>) -> Result<RepoLayout, InitRepoError> {
     let objects_dir = bitcup_dir.join("objects");
     let objects_tmp_dir = objects_dir.join("tmp");
     let refs_heads_dir = bitcup_dir.join("refs").join("heads");
+    let refs_signatures_dir = bitcup_dir.join("refs-signatures");
     let index_dir = bitcup_dir.join("index");
     let locks_dir = bitcup_dir.join("locks");
     let head_file = bitcup_dir.join("HEAD");
@@ -156,6 +172,7 @@ pub fn init_repo(root: impl AsRef<Path>) -> Result<RepoLayout, InitRepoError> {
     create_dir(&objects_dir)?;
     create_dir(&objects_tmp_dir)?;
     create_dir(&refs_heads_dir)?;
+    create_dir(&refs_signatures_dir)?;
     create_dir(&index_dir)?;
     create_dir(&locks_dir)?;
 
@@ -564,6 +581,23 @@ pub fn verify_repo(
                     oid,
                 });
             }
+
+            if options.require_signed_refs {
+                let signature = read_ref_signature(layout, &rel_ref)
+                    .map_err(|e| VerifyError::InvalidRefSignature {
+                        ref_name: rel_ref.clone(),
+                        message: e.to_string(),
+                    })?
+                    .ok_or_else(|| VerifyError::MissingRefSignature {
+                        ref_name: rel_ref.clone(),
+                    })?;
+                verify_commit_oid_signature(&oid, &signature).map_err(|e| {
+                    VerifyError::InvalidRefSignature {
+                        ref_name: rel_ref.clone(),
+                        message: e.to_string(),
+                    }
+                })?;
+            }
             report.ref_count += 1;
 
             if let Some(meta) = metadata.as_ref() {
@@ -581,11 +615,34 @@ pub fn update_ref(
     ref_name: &str,
     oid_hex: &str,
 ) -> Result<(), RefUpdateError> {
+    update_ref_signed(
+        layout,
+        ref_name,
+        oid_hex,
+        None,
+        RefSignaturePolicy::Optional,
+    )
+}
+
+pub fn update_ref_signed(
+    layout: &RepoLayout,
+    ref_name: &str,
+    oid_hex: &str,
+    signature: Option<&CommitSignature>,
+    policy: RefSignaturePolicy,
+) -> Result<(), RefUpdateError> {
     if !is_valid_ref_name(ref_name) {
         return Err(RefUpdateError::InvalidRefName(ref_name.to_string()));
     }
     if !is_valid_oid_hex(oid_hex) {
         return Err(RefUpdateError::InvalidOid);
+    }
+    if policy == RefSignaturePolicy::RequireValidSignature && signature.is_none() {
+        return Err(RefUpdateError::SignatureRequired);
+    }
+    if let Some(sig) = signature {
+        verify_commit_oid_signature(oid_hex, sig)
+            .map_err(|e| RefUpdateError::InvalidSignature(e.to_string()))?;
     }
 
     fs::create_dir_all(&layout.locks_dir).map_err(|source| RefUpdateError::Io {
@@ -637,6 +694,19 @@ pub fn update_ref(
         source: e.error,
     })?;
 
+    if let Some(sig) = signature {
+        let signature_path = signature_file_path(layout, ref_name);
+        write_signature_file(&signature_path, sig)?;
+    } else {
+        let signature_path = signature_file_path(layout, ref_name);
+        if signature_path.exists() {
+            fs::remove_file(&signature_path).map_err(|source| RefUpdateError::Io {
+                path: signature_path.clone(),
+                source,
+            })?;
+        }
+    }
+
     sync_dir(parent)?;
     Ok(())
 }
@@ -664,6 +734,24 @@ pub fn read_ref(layout: &RepoLayout, ref_name: &str) -> Result<Option<String>, R
             source,
         })?;
     Ok(Some(buf.trim().to_string()))
+}
+
+pub fn read_ref_signature(
+    layout: &RepoLayout,
+    ref_name: &str,
+) -> Result<Option<CommitSignature>, RefUpdateError> {
+    if !is_valid_ref_name(ref_name) {
+        return Err(RefUpdateError::InvalidRefName(ref_name.to_string()));
+    }
+    let path = signature_file_path(layout, ref_name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).map_err(|source| RefUpdateError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    parse_signature_bytes(&bytes)
 }
 
 fn create_dir(path: &Path) -> Result<(), InitRepoError> {
@@ -734,6 +822,68 @@ fn sync_dir(path: &Path) -> Result<(), RefUpdateError> {
     })
 }
 
+fn signature_file_path(layout: &RepoLayout, ref_name: &str) -> PathBuf {
+    layout
+        .bitcup_dir
+        .join("refs-signatures")
+        .join(format!("{ref_name}.sig"))
+}
+
+fn write_signature_file(path: &Path, signature: &CommitSignature) -> Result<(), RefUpdateError> {
+    let parent = path.parent().ok_or_else(|| RefUpdateError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::other("signature path has no parent"),
+    })?;
+    fs::create_dir_all(parent).map_err(|source| RefUpdateError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+
+    let mut bytes = Vec::with_capacity(96);
+    bytes.extend_from_slice(&signature.public_key);
+    bytes.extend_from_slice(&signature.signature);
+
+    let mut tmp = NamedTempFile::new_in(parent).map_err(|source| RefUpdateError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    tmp.write_all(&bytes).map_err(|source| RefUpdateError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|source| RefUpdateError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    tmp.persist(path).map_err(|e| RefUpdateError::Io {
+        path: path.to_path_buf(),
+        source: e.error,
+    })?;
+    sync_dir(parent)?;
+    Ok(())
+}
+
+fn parse_signature_bytes(bytes: &[u8]) -> Result<Option<CommitSignature>, RefUpdateError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() != 96 {
+        return Err(RefUpdateError::InvalidSignature(
+            "signature file must be exactly 96 bytes".to_string(),
+        ));
+    }
+    let mut public_key = [0u8; 32];
+    public_key.copy_from_slice(&bytes[..32]);
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&bytes[32..]);
+    Ok(Some(CommitSignature {
+        public_key,
+        signature,
+    }))
+}
+
 fn is_valid_ref_name(name: &str) -> bool {
     name.starts_with("refs/heads/")
         && !name.contains("..")
@@ -752,12 +902,15 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use bitcup_core::{ObjectKind, create_commit, encode_blob};
+    use bitcup_core::{
+        ObjectKind, create_commit, encode_blob, generate_signing_key, sign_commit_oid,
+    };
     use tempfile::tempdir;
 
     use super::{
-        BITCUP_DIR, InitRepoError, MetadataStore, VerifyError, VerifyOptions, init_repo, open_repo,
-        read_object, read_ref, update_ref, verify_repo, write_object,
+        BITCUP_DIR, InitRepoError, MetadataStore, RefSignaturePolicy, RefUpdateError, VerifyError,
+        VerifyOptions, init_repo, open_repo, read_object, read_ref, read_ref_signature, update_ref,
+        update_ref_signed, verify_repo, write_object,
     };
 
     #[test]
@@ -980,6 +1133,7 @@ mod tests {
             &layout,
             VerifyOptions {
                 rebuild_index: false,
+                require_signed_refs: false,
             },
         )
         .expect_err("verify must fail");
@@ -1008,6 +1162,7 @@ mod tests {
             &layout,
             VerifyOptions {
                 rebuild_index: true,
+                require_signed_refs: false,
             },
         )
         .expect("verify");
@@ -1024,5 +1179,62 @@ mod tests {
             .get_commit_parents(&commit_oid.to_string())
             .expect("get commit parents");
         assert_eq!(parents, Some(Vec::new()));
+    }
+
+    #[test]
+    fn signed_ref_update_requires_valid_signature_when_policy_enabled() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("project dir");
+        let layout = init_repo(&root).expect("init");
+        let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let err = update_ref_signed(
+            &layout,
+            "refs/heads/main",
+            oid,
+            None,
+            RefSignaturePolicy::RequireValidSignature,
+        )
+        .expect_err("must fail");
+        assert!(matches!(err, RefUpdateError::SignatureRequired));
+
+        let key = generate_signing_key();
+        let sig = sign_commit_oid(oid, &key).expect("sign");
+        update_ref_signed(
+            &layout,
+            "refs/heads/main",
+            oid,
+            Some(&sig),
+            RefSignaturePolicy::RequireValidSignature,
+        )
+        .expect("signed update");
+
+        let loaded = read_ref_signature(&layout, "refs/heads/main")
+            .expect("read signature")
+            .expect("signature exists");
+        assert_eq!(loaded.public_key, sig.public_key);
+    }
+
+    #[test]
+    fn verify_requires_ref_signature_when_enabled() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("project dir");
+        let layout = init_repo(&root).expect("init");
+
+        let blob = encode_blob(b"x").expect("blob");
+        let blob_oid = write_object(&layout, &blob).expect("write blob");
+        update_ref(&layout, "refs/heads/main", &blob_oid.to_string()).expect("unsigned ref");
+
+        let err = verify_repo(
+            &layout,
+            VerifyOptions {
+                rebuild_index: false,
+                require_signed_refs: true,
+            },
+        )
+        .expect_err("verify must fail");
+        assert!(matches!(err, VerifyError::MissingRefSignature { .. }));
     }
 }
