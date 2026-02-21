@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 thiserror = { workspace = true }
+redb = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
