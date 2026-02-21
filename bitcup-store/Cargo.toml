@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 thiserror = { workspace = true }
 redb = { workspace = true }
+fd-lock = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"

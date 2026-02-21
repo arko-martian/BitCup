@@ -1,8 +1,10 @@
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use fd_lock::RwLock;
 use redb::{Database, TableDefinition};
+use tempfile::NamedTempFile;
 use thiserror::Error;
 
 pub const BITCUP_DIR: &str = ".bitcup";
@@ -51,6 +53,22 @@ pub enum MetadataError {
     },
     #[error("metadata backend error during {op}: {message}")]
     Backend { op: &'static str, message: String },
+}
+
+#[derive(Debug, Error)]
+pub enum RefUpdateError {
+    #[error("invalid reference name: {0}")]
+    InvalidRefName(String),
+    #[error("invalid oid hex")]
+    InvalidOid,
+    #[error("io error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("lock error: {0}")]
+    Lock(String),
 }
 
 pub fn init_repo(root: impl AsRef<Path>) -> Result<RepoLayout, InitRepoError> {
@@ -277,6 +295,96 @@ impl MetadataStore {
     }
 }
 
+pub fn update_ref(
+    layout: &RepoLayout,
+    ref_name: &str,
+    oid_hex: &str,
+) -> Result<(), RefUpdateError> {
+    if !is_valid_ref_name(ref_name) {
+        return Err(RefUpdateError::InvalidRefName(ref_name.to_string()));
+    }
+    if !is_valid_oid_hex(oid_hex) {
+        return Err(RefUpdateError::InvalidOid);
+    }
+
+    fs::create_dir_all(&layout.locks_dir).map_err(|source| RefUpdateError::Io {
+        path: layout.locks_dir.clone(),
+        source,
+    })?;
+    let lock_path = layout.locks_dir.join("refs.lock");
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| RefUpdateError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    let mut lock = RwLock::new(lock_file);
+    let _guard = lock
+        .write()
+        .map_err(|e| RefUpdateError::Lock(e.to_string()))?;
+
+    let ref_path = layout.bitcup_dir.join(ref_name);
+    let parent = ref_path
+        .parent()
+        .ok_or_else(|| RefUpdateError::InvalidRefName(ref_name.to_string()))?;
+    fs::create_dir_all(parent).map_err(|source| RefUpdateError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+
+    let mut tmp = NamedTempFile::new_in(parent).map_err(|source| RefUpdateError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    tmp.write_all(format!("{oid_hex}\n").as_bytes())
+        .map_err(|source| RefUpdateError::Io {
+            path: ref_path.clone(),
+            source,
+        })?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|source| RefUpdateError::Io {
+            path: ref_path.clone(),
+            source,
+        })?;
+    tmp.persist(&ref_path).map_err(|e| RefUpdateError::Io {
+        path: ref_path.clone(),
+        source: e.error,
+    })?;
+
+    sync_dir(parent)?;
+    Ok(())
+}
+
+pub fn read_ref(layout: &RepoLayout, ref_name: &str) -> Result<Option<String>, RefUpdateError> {
+    if !is_valid_ref_name(ref_name) {
+        return Err(RefUpdateError::InvalidRefName(ref_name.to_string()));
+    }
+    let ref_path = layout.bitcup_dir.join(ref_name);
+    if !ref_path.exists() {
+        return Ok(None);
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(&ref_path)
+        .map_err(|source| RefUpdateError::Io {
+            path: ref_path.clone(),
+            source,
+        })?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)
+        .map_err(|source| RefUpdateError::Io {
+            path: ref_path.clone(),
+            source,
+        })?;
+    Ok(Some(buf.trim().to_string()))
+}
+
 fn create_dir(path: &Path) -> Result<(), InitRepoError> {
     fs::create_dir_all(path).map_err(|source| InitRepoError::Io {
         path: path.to_path_buf(),
@@ -305,13 +413,41 @@ fn write_new_file(path: &Path, contents: &[u8]) -> Result<(), InitRepoError> {
     Ok(())
 }
 
+fn sync_dir(path: &Path) -> Result<(), RefUpdateError> {
+    let dir = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|source| RefUpdateError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    dir.sync_all().map_err(|source| RefUpdateError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn is_valid_ref_name(name: &str) -> bool {
+    name.starts_with("refs/heads/")
+        && !name.contains("..")
+        && !name.contains('\\')
+        && !name.ends_with('/')
+        && name.len() > "refs/heads/".len()
+}
+
+fn is_valid_oid_hex(value: &str) -> bool {
+    value.len() == 64 && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Arc;
+    use std::thread;
 
     use tempfile::tempdir;
 
-    use super::{BITCUP_DIR, InitRepoError, MetadataStore, init_repo};
+    use super::{BITCUP_DIR, InitRepoError, MetadataStore, init_repo, read_ref, update_ref};
 
     #[test]
     fn init_repo_creates_expected_layout_and_files() {
@@ -425,5 +561,61 @@ mod tests {
             .get_commit_parents("root-commit")
             .expect("read commit graph");
         assert_eq!(parents, Some(Vec::new()));
+    }
+
+    #[test]
+    fn update_ref_writes_and_overwrites_atomically() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("project dir");
+        let layout = init_repo(&root).expect("init");
+
+        let oid_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let oid_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        update_ref(&layout, "refs/heads/main", oid_a).expect("write ref a");
+        assert_eq!(
+            read_ref(&layout, "refs/heads/main").expect("read ref"),
+            Some(oid_a.to_string())
+        );
+
+        update_ref(&layout, "refs/heads/main", oid_b).expect("write ref b");
+        assert_eq!(
+            read_ref(&layout, "refs/heads/main").expect("read ref"),
+            Some(oid_b.to_string())
+        );
+    }
+
+    #[test]
+    fn update_ref_concurrent_writers_do_not_corrupt_content() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("project dir");
+        let layout = Arc::new(init_repo(&root).expect("init"));
+        let expected = vec![
+            "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            "2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+            "3333333333333333333333333333333333333333333333333333333333333333".to_string(),
+            "4444444444444444444444444444444444444444444444444444444444444444".to_string(),
+        ];
+
+        let mut threads = Vec::new();
+        for oid in expected.clone() {
+            let layout = Arc::clone(&layout);
+            threads.push(thread::spawn(move || {
+                for _ in 0..20 {
+                    update_ref(&layout, "refs/heads/main", &oid).expect("concurrent write");
+                }
+            }));
+        }
+        for t in threads {
+            t.join().expect("join");
+        }
+
+        let final_value = read_ref(&layout, "refs/heads/main")
+            .expect("read ref")
+            .expect("value must exist");
+        assert_eq!(final_value.len(), 64);
+        assert!(final_value.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(expected.contains(&final_value));
     }
 }
