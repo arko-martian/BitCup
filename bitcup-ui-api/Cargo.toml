@@ -2,13 +2,14 @@
 name = "bitcup-ui-api"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
-bitcup-api = { path = "../bitcup-api" }
+bitcup-api = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-bitcup-core = { path = "../bitcup-core" }
-bitcup-store = { path = "../bitcup-store" }
+bitcup-core = { workspace = true }
+bitcup-store = { workspace = true }
 tempfile = "3"

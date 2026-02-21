@@ -2,10 +2,11 @@
 name = "bitcup-api"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
-bitcup-core = { path = "../bitcup-core" }
-bitcup-store = { path = "../bitcup-store" }
+bitcup-core = { workspace = true }
+bitcup-store = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

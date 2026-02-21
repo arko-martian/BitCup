@@ -11,7 +11,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-license = "AGPL"
+license = "AGPL-3.0-only"
 authors = ["BitCup Team"]
 
 [workspace.dependencies]
@@ -32,3 +32,7 @@ zeroize = "1"
 age = "0.11"
 proptest = "1"
 serde = { version = "1", features = ["derive"] }
+bitcup-core = { version = "0.1.0", path = "bitcup-core" }
+bitcup-store = { version = "0.1.0", path = "bitcup-store" }
+bitcup-api = { version = "0.1.0", path = "bitcup-api" }
+bitcup-ui-api = { version = "0.1.0", path = "bitcup-ui-api" }

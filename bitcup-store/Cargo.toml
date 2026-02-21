@@ -2,13 +2,14 @@
 name = "bitcup-store"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
 redb = { workspace = true }
 fd-lock = { workspace = true }
 tempfile = "3"
-bitcup-core = { path = "../bitcup-core" }
+bitcup-core = { workspace = true }
 age = { workspace = true }
 
 [dev-dependencies]
