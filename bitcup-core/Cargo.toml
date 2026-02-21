@@ -8,6 +8,8 @@ blake3 = { workspace = true }
 rkyv = { workspace = true, features = ["bytecheck"] }
 bytecheck = { workspace = true }
 ignore = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

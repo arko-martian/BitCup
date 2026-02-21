@@ -2,6 +2,8 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use rand_core::OsRng;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 const MAGIC: [u8; 4] = *b"BCUP";
@@ -335,6 +337,63 @@ impl fmt::Display for CommitError {
 }
 
 impl std::error::Error for CommitError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSignature {
+    pub public_key: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningError {
+    InvalidOid,
+    InvalidPublicKey,
+    InvalidSignature,
+    VerificationFailed,
+}
+
+impl fmt::Display for SigningError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidOid => write!(f, "invalid oid hex"),
+            Self::InvalidPublicKey => write!(f, "invalid public key bytes"),
+            Self::InvalidSignature => write!(f, "invalid signature bytes"),
+            Self::VerificationFailed => write!(f, "signature verification failed"),
+        }
+    }
+}
+
+impl std::error::Error for SigningError {}
+
+pub fn generate_signing_key() -> SigningKey {
+    SigningKey::generate(&mut OsRng)
+}
+
+pub fn sign_commit_oid(oid_hex: &str, key: &SigningKey) -> Result<CommitSignature, SigningError> {
+    if !is_valid_oid_hex(oid_hex) {
+        return Err(SigningError::InvalidOid);
+    }
+    let signature: Signature = key.sign(oid_hex.as_bytes());
+    Ok(CommitSignature {
+        public_key: key.verifying_key().to_bytes(),
+        signature: signature.to_bytes(),
+    })
+}
+
+pub fn verify_commit_oid_signature(
+    oid_hex: &str,
+    signature: &CommitSignature,
+) -> Result<(), SigningError> {
+    if !is_valid_oid_hex(oid_hex) {
+        return Err(SigningError::InvalidOid);
+    }
+    let verifying_key = VerifyingKey::from_bytes(&signature.public_key)
+        .map_err(|_| SigningError::InvalidPublicKey)?;
+    let signature = Signature::from_bytes(&signature.signature);
+    verifying_key
+        .verify(oid_hex.as_bytes(), &signature)
+        .map_err(|_| SigningError::VerificationFailed)
+}
 
 pub fn create_commit(
     tree_oid_hex: &str,
@@ -697,5 +756,30 @@ mod tests {
         .expect("create commit b");
 
         assert_ne!(commit_a.object_id(), commit_b.object_id());
+    }
+
+    #[test]
+    fn commit_signature_sign_and_verify_roundtrip() {
+        let oid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let key = generate_signing_key();
+        let sig = sign_commit_oid(oid, &key).expect("sign");
+        verify_commit_oid_signature(oid, &sig).expect("verify");
+    }
+
+    #[test]
+    fn commit_signature_rejects_tampered_oid() {
+        let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let key = generate_signing_key();
+        let sig = sign_commit_oid(oid, &key).expect("sign");
+        let tampered = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let err = verify_commit_oid_signature(tampered, &sig).expect_err("must fail");
+        assert_eq!(err, SigningError::VerificationFailed);
+    }
+
+    #[test]
+    fn commit_signature_rejects_invalid_oid_input() {
+        let key = generate_signing_key();
+        let err = sign_commit_oid("not-oid", &key).expect_err("must fail");
+        assert_eq!(err, SigningError::InvalidOid);
     }
 }

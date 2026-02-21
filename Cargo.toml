@@ -23,3 +23,5 @@ redb = "2"
 ignore = "0.4"
 fd-lock = "4"
 clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
