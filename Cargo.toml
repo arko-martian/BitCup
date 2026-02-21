@@ -4,7 +4,9 @@ members = [
   "bitcup-store",
   "bitcup-api",
   "bitcup-cli",
+  "bitcup-ui-api",
 ]
+exclude = ["bitcup-ui/src-tauri"]
 resolver = "3"
 
 [workspace.package]
@@ -27,3 +29,6 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 secrecy = "0.10"
 zeroize = "1"
+age = "0.11"
+proptest = "1"
+serde = { version = "1", features = ["derive"] }

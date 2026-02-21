@@ -1,7 +1,10 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::iter;
 use std::path::{Path, PathBuf};
 
+use age::secrecy::SecretString as AgeSecretString;
+use age::{Decryptor, Encryptor, Identity};
 use bitcup_core::{CommitSignature, ObjectEnvelope, ObjectId, verify_commit_oid_signature};
 use fd_lock::RwLock;
 use redb::{Database, TableDefinition};
@@ -146,6 +149,22 @@ pub enum VerifyError {
 pub enum RefSignaturePolicy {
     Optional,
     RequireValidSignature,
+}
+
+#[derive(Debug, Error)]
+pub enum BundleError {
+    #[error("io error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("encrypt error: {0}")]
+    Encrypt(String),
+    #[error("decrypt error: {0}")]
+    Decrypt(String),
+    #[error("invalid bundle format: {0}")]
+    InvalidFormat(String),
 }
 
 pub fn init_repo(root: impl AsRef<Path>) -> Result<RepoLayout, InitRepoError> {
@@ -610,6 +629,65 @@ pub fn verify_repo(
     Ok(report)
 }
 
+pub fn export_encrypted_bundle(
+    layout: &RepoLayout,
+    output_path: &Path,
+    passphrase: &str,
+) -> Result<(), BundleError> {
+    let files = walk_files_plain(&layout.bitcup_dir).map_err(|source| BundleError::Io {
+        path: layout.bitcup_dir.clone(),
+        source,
+    })?;
+    let plain = serialize_bundle(&layout.bitcup_dir, &files)?;
+
+    let encryptor = Encryptor::with_user_passphrase(AgeSecretString::from(passphrase.to_owned()));
+    let mut encrypted = Vec::new();
+    let mut writer = encryptor
+        .wrap_output(&mut encrypted)
+        .map_err(|e| BundleError::Encrypt(e.to_string()))?;
+    writer
+        .write_all(&plain)
+        .map_err(|e| BundleError::Encrypt(e.to_string()))?;
+    writer
+        .finish()
+        .map_err(|e| BundleError::Encrypt(e.to_string()))?;
+
+    fs::write(output_path, encrypted).map_err(|source| BundleError::Io {
+        path: output_path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+pub fn import_encrypted_bundle(
+    root: &Path,
+    input_path: &Path,
+    passphrase: &str,
+) -> Result<RepoLayout, BundleError> {
+    let encrypted = fs::read(input_path).map_err(|source| BundleError::Io {
+        path: input_path.to_path_buf(),
+        source,
+    })?;
+    let decryptor =
+        Decryptor::new(&encrypted[..]).map_err(|e| BundleError::Decrypt(e.to_string()))?;
+    let mut plain = Vec::new();
+    let identity = age::scrypt::Identity::new(AgeSecretString::from(passphrase.to_owned()));
+    let mut reader = decryptor
+        .decrypt(iter::once(&identity as &dyn Identity))
+        .map_err(|e| BundleError::Decrypt(e.to_string()))?;
+    reader
+        .read_to_end(&mut plain)
+        .map_err(|e| BundleError::Decrypt(e.to_string()))?;
+
+    let layout = if root.join(BITCUP_DIR).exists() {
+        open_repo(root).map_err(|e| BundleError::InvalidFormat(e.to_string()))?
+    } else {
+        init_repo(root).map_err(|e| BundleError::InvalidFormat(e.to_string()))?
+    };
+    deserialize_bundle_into(&layout.bitcup_dir, &plain)?;
+    Ok(layout)
+}
+
 pub fn update_ref(
     layout: &RepoLayout,
     ref_name: &str,
@@ -808,6 +886,111 @@ fn walk_files(root: &Path) -> Result<Vec<PathBuf>, VerifyError> {
     Ok(out)
 }
 
+fn walk_files_plain(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn serialize_bundle(root: &Path, files: &[PathBuf]) -> Result<Vec<u8>, BundleError> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"BCB1");
+    out.extend_from_slice(&(files.len() as u32).to_be_bytes());
+
+    for path in files {
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| BundleError::InvalidFormat("bundle path outside root".to_string()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let data = fs::read(path).map_err(|source| BundleError::Io {
+            path: path.clone(),
+            source,
+        })?;
+
+        out.extend_from_slice(&(rel.len() as u32).to_be_bytes());
+        out.extend_from_slice(rel.as_bytes());
+        out.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        out.extend_from_slice(&data);
+    }
+
+    Ok(out)
+}
+
+fn deserialize_bundle_into(root: &Path, bytes: &[u8]) -> Result<(), BundleError> {
+    let mut cursor = 0usize;
+    if bytes.len() < 8 || &bytes[0..4] != b"BCB1" {
+        return Err(BundleError::InvalidFormat(
+            "invalid bundle magic/header".to_string(),
+        ));
+    }
+    cursor += 4;
+    let file_count = read_u32(bytes, &mut cursor)? as usize;
+
+    for _ in 0..file_count {
+        let path_len = read_u32(bytes, &mut cursor)? as usize;
+        let path_bytes = read_slice(bytes, &mut cursor, path_len)?;
+        let rel = std::str::from_utf8(path_bytes)
+            .map_err(|e| BundleError::InvalidFormat(e.to_string()))?;
+        if rel.contains("..") || rel.starts_with('/') {
+            return Err(BundleError::InvalidFormat(
+                "path traversal detected in bundle".to_string(),
+            ));
+        }
+        let data_len = read_u64(bytes, &mut cursor)? as usize;
+        let data = read_slice(bytes, &mut cursor, data_len)?;
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| BundleError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        fs::write(&path, data).map_err(|source| BundleError::Io { path, source })?;
+    }
+    Ok(())
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, BundleError> {
+    let raw = read_slice(bytes, cursor, 4)?;
+    Ok(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, BundleError> {
+    let raw = read_slice(bytes, cursor, 8)?;
+    Ok(u64::from_be_bytes([
+        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+    ]))
+}
+
+fn read_slice<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], BundleError> {
+    if *cursor + len > bytes.len() {
+        return Err(BundleError::InvalidFormat(
+            "unexpected end of bundle".to_string(),
+        ));
+    }
+    let slice = &bytes[*cursor..*cursor + len];
+    *cursor += len;
+    Ok(slice)
+}
+
 fn sync_dir(path: &Path) -> Result<(), RefUpdateError> {
     let dir = OpenOptions::new()
         .read(true)
@@ -905,12 +1088,14 @@ mod tests {
     use bitcup_core::{
         ObjectKind, create_commit, encode_blob, generate_signing_key, sign_commit_oid,
     };
+    use proptest::prelude::*;
     use tempfile::tempdir;
 
     use super::{
         BITCUP_DIR, InitRepoError, MetadataStore, RefSignaturePolicy, RefUpdateError, VerifyError,
-        VerifyOptions, init_repo, open_repo, read_object, read_ref, read_ref_signature, update_ref,
-        update_ref_signed, verify_repo, write_object,
+        VerifyOptions, export_encrypted_bundle, import_encrypted_bundle, init_repo, open_repo,
+        read_object, read_ref, read_ref_signature, update_ref, update_ref_signed, verify_repo,
+        write_object,
     };
 
     #[test]
@@ -1236,5 +1421,88 @@ mod tests {
         )
         .expect_err("verify must fail");
         assert!(matches!(err, VerifyError::MissingRefSignature { .. }));
+    }
+
+    #[test]
+    fn encrypted_bundle_export_import_roundtrip() {
+        let temp = tempdir().expect("temp dir");
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root).expect("source root");
+        let source_layout = init_repo(&source_root).expect("init source");
+        let blob = encode_blob(b"bundle-data").expect("blob");
+        let blob_oid = write_object(&source_layout, &blob).expect("write blob");
+        update_ref(&source_layout, "refs/heads/main", &blob_oid.to_string()).expect("update ref");
+
+        let bundle_path = temp.path().join("backup.bitcup.age");
+        export_encrypted_bundle(&source_layout, &bundle_path, "top-secret").expect("export");
+
+        let target_root = temp.path().join("target");
+        fs::create_dir_all(&target_root).expect("target root");
+        let imported =
+            import_encrypted_bundle(&target_root, &bundle_path, "top-secret").expect("import");
+        let loaded = read_object(&imported, &blob_oid.to_string())
+            .expect("read")
+            .expect("exists");
+        assert_eq!(loaded.kind, ObjectKind::Blob);
+        assert_eq!(
+            read_ref(&imported, "refs/heads/main").expect("read ref"),
+            Some(blob_oid.to_string())
+        );
+    }
+
+    #[test]
+    fn encrypted_bundle_import_rejects_wrong_passphrase() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("root");
+        let layout = init_repo(&root).expect("init");
+        let bundle_path = temp.path().join("backup.bitcup.age");
+        export_encrypted_bundle(&layout, &bundle_path, "correct").expect("export");
+
+        let target_root = temp.path().join("target");
+        fs::create_dir_all(&target_root).expect("target root");
+        let err =
+            import_encrypted_bundle(&target_root, &bundle_path, "wrong").expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("decrypt"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn prop_import_bundle_handles_arbitrary_ciphertext(
+            ciphertext in proptest::collection::vec(any::<u8>(), 0..4096),
+            passphrase in ".*"
+        ) {
+            let temp = tempdir().expect("temp dir");
+            let root = temp.path().join("target");
+            fs::create_dir_all(&root).expect("target root");
+            let input = temp.path().join("random.bitcup.age");
+            fs::write(&input, ciphertext).expect("write random ciphertext");
+
+            let _ = import_encrypted_bundle(&root, &input, &passphrase);
+        }
+
+        #[test]
+        fn fuzz_smoke_verify_repo_handles_malformed_objects(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let temp = tempdir().expect("temp dir");
+            let root = temp.path().join("project");
+            fs::create_dir_all(&root).expect("root");
+            let layout = init_repo(&root).expect("init");
+
+            let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let path = layout.objects_dir.join("aa").join(&oid[2..]);
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir fanout");
+            fs::write(path, bytes).expect("write malformed object");
+
+            let _ = verify_repo(
+                &layout,
+                VerifyOptions {
+                    rebuild_index: false,
+                    require_signed_refs: false,
+                },
+            );
+        }
     }
 }

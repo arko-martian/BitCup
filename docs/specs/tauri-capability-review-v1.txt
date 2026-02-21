@@ -1,0 +1,23 @@
+BitCup T017 Capability Review (v1)
+Date: 2026-02-21
+
+Scope:
+- Tauri v2 shell for read-only repository browse operations.
+- No direct filesystem mutation commands exposed to frontend.
+
+Exposed commands:
+- ui_head(repo_path)
+- ui_list_refs(repo_path)
+- ui_show_object(repo_path, oid)
+- ui_verify_read_only(repo_path)
+
+Security controls:
+1. Command surface is read-only by construction and maps to bitcup-ui-api read-only methods.
+2. Capability file limits window access to "main" and uses core default permission set only.
+3. No filesystem plugin permissions are granted to webview.
+4. CSP in tauri.conf.json restricts sources to self and data images.
+5. UI state is path-parameterized and does not retain privileged write handles.
+
+Residual risks:
+- Repository path input is user-controlled; backend still enforces repo-open checks.
+- UI shell build validation requires fetching Tauri dependencies in a network-enabled environment.

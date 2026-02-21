@@ -7,8 +7,8 @@ use bitcup_core::{
     sign_commit_oid_with_secret_hex, snapshot_tree,
 };
 use bitcup_store::{
-    RefSignaturePolicy, VerifyOptions, init_repo, open_repo, read_object, read_ref, update_ref,
-    update_ref_signed, verify_repo, write_object,
+    RefSignaturePolicy, VerifyOptions, export_encrypted_bundle, import_encrypted_bundle, init_repo,
+    open_repo, read_object, read_ref, update_ref, update_ref_signed, verify_repo, write_object,
 };
 use clap::{Parser, Subcommand};
 
@@ -44,6 +44,18 @@ enum Commands {
         #[arg(long)]
         require_signed_refs: bool,
     },
+    BundleExport {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        passphrase: String,
+    },
+    BundleImport {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        passphrase: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -65,6 +77,10 @@ fn main() -> Result<()> {
             rebuild_index,
             require_signed_refs,
         } => cmd_verify(cwd, rebuild_index, require_signed_refs),
+        Commands::BundleExport { output, passphrase } => {
+            cmd_bundle_export(cwd, output, &passphrase)
+        }
+        Commands::BundleImport { input, passphrase } => cmd_bundle_import(cwd, input, &passphrase),
     }
 }
 
@@ -242,6 +258,21 @@ fn cmd_verify(root: PathBuf, rebuild_index: bool, require_signed_refs: bool) -> 
     println!("refs: {}", report.ref_count);
     println!("rebuild_index: {}", rebuild_index);
     println!("require_signed_refs: {}", require_signed_refs);
+    Ok(())
+}
+
+fn cmd_bundle_export(root: PathBuf, output: PathBuf, passphrase: &str) -> Result<()> {
+    let layout =
+        open_repo(&root).with_context(|| format!("failed to open repo at {}", root.display()))?;
+    export_encrypted_bundle(&layout, &output, passphrase).context("bundle export failed")?;
+    println!("bundle exported to {}", output.display());
+    Ok(())
+}
+
+fn cmd_bundle_import(root: PathBuf, input: PathBuf, passphrase: &str) -> Result<()> {
+    let layout =
+        import_encrypted_bundle(&root, &input, passphrase).context("bundle import failed")?;
+    println!("bundle imported into {}", layout.bitcup_dir.display());
     Ok(())
 }
 

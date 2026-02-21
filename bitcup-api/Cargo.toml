@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bitcup-core = { path = "../bitcup-core" }
+bitcup-store = { path = "../bitcup-store" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

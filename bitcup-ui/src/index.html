@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BitCup UI</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="hero">
+        <h1>BitCup Read-Only Explorer</h1>
+        <p>Capability-scoped desktop shell for local repository inspection.</p>
+      </header>
+
+      <section class="panel">
+        <label for="repoPath">Repository Path</label>
+        <div class="row">
+          <input id="repoPath" type="text" placeholder="/path/to/repo" />
+          <button id="openBtn">Open</button>
+        </div>
+        <p id="status" class="status">Waiting for repository path.</p>
+      </section>
+
+      <section class="grid">
+        <article class="card">
+          <h2>HEAD</h2>
+          <pre id="headValue">-</pre>
+        </article>
+        <article class="card">
+          <h2>Verify</h2>
+          <pre id="verifyValue">-</pre>
+        </article>
+      </section>
+
+      <section class="panel">
+        <h2>References</h2>
+        <pre id="refsValue">-</pre>
+      </section>
+
+      <section class="panel">
+        <h2>Object Lookup</h2>
+        <div class="row">
+          <input id="oidInput" type="text" placeholder="64-char object id" />
+          <button id="showBtn">Show</button>
+        </div>
+        <pre id="objectValue">-</pre>
+      </section>
+    </main>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

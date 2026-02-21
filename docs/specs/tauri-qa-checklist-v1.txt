@@ -1,0 +1,23 @@
+BitCup T017 QA Checklist (Read-only shell)
+
+Local checks completed:
+- cargo test -p bitcup-ui-api
+- cargo test --workspace --all-targets
+- cargo test --workspace --release
+
+Manual desktop checks to run in a network-enabled environment:
+1. Install frontend + tauri deps in bitcup-ui:
+   - npm install
+2. Run dev shell:
+   - npm run tauri:dev
+3. Validate read-only behavior:
+   - Open repo path
+   - View HEAD, refs, verify summary
+   - Lookup blob/tree/commit object
+4. Negative checks:
+   - Invalid path returns error
+   - Missing OID returns null
+   - Corrupted repo shows verify error
+5. Capability review:
+   - Confirm only read-only commands are registered in src-tauri/src/lib.rs
+   - Confirm capabilities/default.json binds to main window only

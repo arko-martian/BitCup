@@ -1,0 +1,39 @@
+name: Security Gates
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Cargo audit
+        run: cargo audit
+
+      - name: Cargo deny
+        run: cargo deny check
+
+      - name: Property tests (core)
+        run: cargo test -p bitcup-core prop_ -- --nocapture
+
+      - name: Property tests (store)
+        run: cargo test -p bitcup-store prop_ -- --nocapture
+
+      - name: Fuzz smoke (core)
+        run: cargo test -p bitcup-core fuzz_smoke -- --nocapture
+
+      - name: Fuzz smoke (store)
+        run: cargo test -p bitcup-store fuzz_smoke -- --nocapture

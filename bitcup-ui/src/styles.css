@@ -1,0 +1,103 @@
+:root {
+  --bg0: #f4efe6;
+  --bg1: #d9e4d8;
+  --panel: #fffdf8;
+  --ink: #1f2a33;
+  --accent: #1c6b58;
+  --accent-2: #b55a2a;
+  --muted: #5a6870;
+  --border: #ced4cc;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+  background:
+    radial-gradient(circle at 10% 0%, #ffffffa0, transparent 40%),
+    radial-gradient(circle at 80% 10%, #fff2cc90, transparent 36%),
+    linear-gradient(140deg, var(--bg0), var(--bg1));
+  min-height: 100vh;
+}
+
+.app {
+  margin: 0 auto;
+  max-width: 980px;
+  padding: 28px 18px 40px;
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: clamp(1.8rem, 4vw, 2.6rem);
+  letter-spacing: 0.02em;
+}
+
+.hero p {
+  margin: 0.5rem 0 1.2rem;
+  color: var(--muted);
+}
+
+.panel,
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px;
+  box-shadow: 0 10px 24px #00000010;
+}
+
+.panel {
+  margin-top: 12px;
+}
+
+.grid {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+}
+
+input,
+button {
+  font: inherit;
+}
+
+input {
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #fff;
+}
+
+button {
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 14px;
+  color: #fff;
+  background: linear-gradient(120deg, var(--accent), var(--accent-2));
+  cursor: pointer;
+}
+
+pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-size: 0.86rem;
+  color: #2a3c46;
+}
+
+.status {
+  margin-top: 8px;
+  color: var(--muted);
+}

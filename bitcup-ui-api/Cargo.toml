@@ -1,0 +1,14 @@
+[package]
+name = "bitcup-ui-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitcup-api = { path = "../bitcup-api" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+bitcup-core = { path = "../bitcup-core" }
+bitcup-store = { path = "../bitcup-store" }
+tempfile = "3"

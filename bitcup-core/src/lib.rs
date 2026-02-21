@@ -597,6 +597,7 @@ impl std::error::Error for BlobError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn canonical_encoding_layout_is_stable() {
@@ -839,5 +840,29 @@ mod tests {
         let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let sig = sign_commit_oid_with_secret_hex(oid, secret).expect("sign");
         verify_commit_oid_signature(oid, &sig).expect("verify");
+    }
+
+    proptest! {
+        #[test]
+        fn prop_blob_oid_is_deterministic_for_same_payload(payload in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let a = encode_blob(&payload).expect("encode a");
+            let b = encode_blob(&payload).expect("encode b");
+            prop_assert_eq!(a.object_id(), b.object_id());
+        }
+
+        #[test]
+        fn fuzz_smoke_decode_canonical_handles_arbitrary_bytes(input in proptest::collection::vec(any::<u8>(), 0..8192)) {
+            let _ = ObjectEnvelope::decode_canonical(&input);
+        }
+
+        #[test]
+        fn fuzz_smoke_decode_blob_handles_mutated_payload(payload in proptest::collection::vec(any::<u8>(), 0..2048), flip in any::<u8>()) {
+            let mut envelope = encode_blob(&payload).expect("encode");
+            if !envelope.payload.is_empty() {
+                let idx = (flip as usize) % envelope.payload.len();
+                envelope.payload[idx] ^= 0xff;
+            }
+            let _ = decode_blob(&envelope);
+        }
     }
 }
