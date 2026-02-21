@@ -8,5 +8,6 @@ thiserror = { workspace = true }
 redb = { workspace = true }
 fd-lock = { workspace = true }
 tempfile = "3"
+bitcup-core = { path = "../bitcup-core" }
 
 [dev-dependencies]

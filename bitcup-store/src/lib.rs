@@ -2,6 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use bitcup_core::{ObjectEnvelope, ObjectId};
 use fd_lock::RwLock;
 use redb::{Database, TableDefinition};
 use tempfile::NamedTempFile;
@@ -34,6 +35,14 @@ pub enum InitRepoError {
         #[source]
         source: std::io::Error,
     },
+}
+
+#[derive(Debug, Error)]
+pub enum OpenRepoError {
+    #[error("repository root does not exist: {0}")]
+    MissingRoot(PathBuf),
+    #[error("not a bitcup repository (missing .bitcup): {0}")]
+    MissingBitcupDir(PathBuf),
 }
 
 const REF_CACHE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("refs_cache");
@@ -69,6 +78,59 @@ pub enum RefUpdateError {
     },
     #[error("lock error: {0}")]
     Lock(String),
+}
+
+#[derive(Debug, Error)]
+pub enum ObjectStoreError {
+    #[error("invalid oid hex")]
+    InvalidOid,
+    #[error("io error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("decode error: {0}")]
+    Decode(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyOptions {
+    pub rebuild_index: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct VerifyReport {
+    pub object_count: usize,
+    pub ref_count: usize,
+}
+
+#[derive(Debug, Error)]
+pub enum VerifyError {
+    #[error("io error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid object filename at {path}")]
+    InvalidObjectPath { path: PathBuf },
+    #[error("invalid object id format: {0}")]
+    InvalidOid(String),
+    #[error("object decode failed for {oid}: {message}")]
+    Decode { oid: String, message: String },
+    #[error("object id mismatch for {path}: expected {expected}, got {actual}")]
+    OidMismatch {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("invalid ref contents in {path}")]
+    InvalidRef { path: PathBuf },
+    #[error("missing object referenced by ref {ref_name}: {oid}")]
+    MissingRefObject { ref_name: String, oid: String },
+    #[error("metadata error: {0}")]
+    Metadata(String),
 }
 
 pub fn init_repo(root: impl AsRef<Path>) -> Result<RepoLayout, InitRepoError> {
@@ -113,6 +175,29 @@ pub fn init_repo(root: impl AsRef<Path>) -> Result<RepoLayout, InitRepoError> {
         locks_dir,
         head_file,
         config_file,
+    })
+}
+
+pub fn open_repo(root: impl AsRef<Path>) -> Result<RepoLayout, OpenRepoError> {
+    let root = root.as_ref();
+    if !root.exists() {
+        return Err(OpenRepoError::MissingRoot(root.to_path_buf()));
+    }
+    let bitcup_dir = root.join(BITCUP_DIR);
+    if !bitcup_dir.is_dir() {
+        return Err(OpenRepoError::MissingBitcupDir(bitcup_dir));
+    }
+
+    Ok(RepoLayout {
+        root: root.to_path_buf(),
+        objects_dir: bitcup_dir.join("objects"),
+        objects_tmp_dir: bitcup_dir.join("objects").join("tmp"),
+        refs_heads_dir: bitcup_dir.join("refs").join("heads"),
+        index_dir: bitcup_dir.join("index"),
+        locks_dir: bitcup_dir.join("locks"),
+        head_file: bitcup_dir.join("HEAD"),
+        config_file: bitcup_dir.join("config.toml"),
+        bitcup_dir,
     })
 }
 
@@ -295,6 +380,202 @@ impl MetadataStore {
     }
 }
 
+pub fn write_object(
+    layout: &RepoLayout,
+    envelope: &ObjectEnvelope,
+) -> Result<ObjectId, ObjectStoreError> {
+    let oid = envelope.object_id();
+    let oid_hex = oid.to_string();
+    let fanout = &oid_hex[0..2];
+    let rest = &oid_hex[2..];
+
+    let dir = layout.objects_dir.join(fanout);
+    fs::create_dir_all(&dir).map_err(|source| ObjectStoreError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+
+    let final_path = dir.join(rest);
+    if final_path.exists() {
+        return Ok(oid);
+    }
+
+    let mut tmp = NamedTempFile::new_in(&dir).map_err(|source| ObjectStoreError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    let bytes = envelope.encode_canonical();
+    tmp.write_all(&bytes)
+        .map_err(|source| ObjectStoreError::Io {
+            path: final_path.clone(),
+            source,
+        })?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|source| ObjectStoreError::Io {
+            path: final_path.clone(),
+            source,
+        })?;
+    tmp.persist(&final_path).map_err(|e| ObjectStoreError::Io {
+        path: final_path.clone(),
+        source: e.error,
+    })?;
+    sync_dir(&dir).map_err(|e| match e {
+        RefUpdateError::Io { path, source } => ObjectStoreError::Io { path, source },
+        _ => ObjectStoreError::Io {
+            path: dir.clone(),
+            source: std::io::Error::other("directory sync error"),
+        },
+    })?;
+    Ok(oid)
+}
+
+pub fn read_object(
+    layout: &RepoLayout,
+    oid_hex: &str,
+) -> Result<Option<ObjectEnvelope>, ObjectStoreError> {
+    if !is_valid_oid_hex(oid_hex) {
+        return Err(ObjectStoreError::InvalidOid);
+    }
+    let fanout = &oid_hex[0..2];
+    let rest = &oid_hex[2..];
+    let path = layout.objects_dir.join(fanout).join(rest);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&path).map_err(|source| ObjectStoreError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let envelope = ObjectEnvelope::decode_canonical(&bytes)
+        .map_err(|e| ObjectStoreError::Decode(e.to_string()))?;
+    Ok(Some(envelope))
+}
+
+pub fn verify_repo(
+    layout: &RepoLayout,
+    options: VerifyOptions,
+) -> Result<VerifyReport, VerifyError> {
+    let mut report = VerifyReport::default();
+    let metadata = if options.rebuild_index {
+        Some(MetadataStore::open(layout).map_err(|e| VerifyError::Metadata(e.to_string()))?)
+    } else {
+        None
+    };
+
+    for fanout in fs::read_dir(&layout.objects_dir).map_err(|source| VerifyError::Io {
+        path: layout.objects_dir.clone(),
+        source,
+    })? {
+        let fanout = fanout.map_err(|source| VerifyError::Io {
+            path: layout.objects_dir.clone(),
+            source,
+        })?;
+        let fanout_path = fanout.path();
+        if !fanout_path.is_dir() {
+            continue;
+        }
+        let fanout_name = fanout.file_name().to_string_lossy().to_string();
+        if fanout_name == "tmp" {
+            continue;
+        }
+        if fanout_name.len() != 2 || !fanout_name.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+            return Err(VerifyError::InvalidObjectPath { path: fanout_path });
+        }
+
+        for entry in fs::read_dir(fanout.path()).map_err(|source| VerifyError::Io {
+            path: fanout.path(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| VerifyError::Io {
+                path: fanout.path(),
+                source,
+            })?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let rest = entry.file_name().to_string_lossy().to_string();
+            let oid_hex = format!("{fanout_name}{rest}");
+            if !is_valid_oid_hex(&oid_hex) {
+                return Err(VerifyError::InvalidOid(oid_hex));
+            }
+
+            let bytes = fs::read(&path).map_err(|source| VerifyError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let envelope =
+                ObjectEnvelope::decode_canonical(&bytes).map_err(|e| VerifyError::Decode {
+                    oid: oid_hex.clone(),
+                    message: e.to_string(),
+                })?;
+
+            let actual = envelope.object_id().to_string();
+            if actual != oid_hex {
+                return Err(VerifyError::OidMismatch {
+                    path,
+                    expected: oid_hex,
+                    actual,
+                });
+            }
+            report.object_count += 1;
+
+            if let Some(meta) = metadata.as_ref()
+                && envelope.kind == bitcup_core::ObjectKind::Commit
+            {
+                let commit =
+                    bitcup_core::decode_commit(&envelope).map_err(|e| VerifyError::Decode {
+                        oid: envelope.object_id().to_string(),
+                        message: e.to_string(),
+                    })?;
+                meta.set_commit_parents(&envelope.object_id().to_string(), &commit.parent_oids_hex)
+                    .map_err(|e| VerifyError::Metadata(e.to_string()))?;
+            }
+        }
+    }
+
+    let refs_root = layout.bitcup_dir.join("refs");
+    if refs_root.exists() {
+        for path in walk_files(&refs_root)? {
+            let rel_ref = path
+                .strip_prefix(&layout.bitcup_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            let value = fs::read_to_string(&path).map_err(|source| VerifyError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let oid = value.trim().to_string();
+            if !is_valid_oid_hex(&oid) {
+                return Err(VerifyError::InvalidRef { path });
+            }
+
+            if read_object(layout, &oid)
+                .map_err(|e| VerifyError::Metadata(e.to_string()))?
+                .is_none()
+            {
+                return Err(VerifyError::MissingRefObject {
+                    ref_name: rel_ref,
+                    oid,
+                });
+            }
+            report.ref_count += 1;
+
+            if let Some(meta) = metadata.as_ref() {
+                meta.set_ref_cache(&rel_ref, &oid)
+                    .map_err(|e| VerifyError::Metadata(e.to_string()))?;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 pub fn update_ref(
     layout: &RepoLayout,
     ref_name: &str,
@@ -413,6 +694,32 @@ fn write_new_file(path: &Path, contents: &[u8]) -> Result<(), InitRepoError> {
     Ok(())
 }
 
+fn walk_files(root: &Path) -> Result<Vec<PathBuf>, VerifyError> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).map_err(|source| VerifyError::Io {
+            path: dir.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| VerifyError::Io {
+                path: dir.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+
+    out.sort();
+    Ok(out)
+}
+
 fn sync_dir(path: &Path) -> Result<(), RefUpdateError> {
     let dir = OpenOptions::new()
         .read(true)
@@ -445,9 +752,13 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    use bitcup_core::{ObjectKind, create_commit, encode_blob};
     use tempfile::tempdir;
 
-    use super::{BITCUP_DIR, InitRepoError, MetadataStore, init_repo, read_ref, update_ref};
+    use super::{
+        BITCUP_DIR, InitRepoError, MetadataStore, VerifyError, VerifyOptions, init_repo, open_repo,
+        read_object, read_ref, update_ref, verify_repo, write_object,
+    };
 
     #[test]
     fn init_repo_creates_expected_layout_and_files() {
@@ -617,5 +928,101 @@ mod tests {
         assert_eq!(final_value.len(), 64);
         assert!(final_value.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(expected.contains(&final_value));
+    }
+
+    #[test]
+    fn open_repo_succeeds_after_init() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("project dir");
+        let _layout = init_repo(&root).expect("init");
+
+        let opened = open_repo(&root).expect("open");
+        assert!(opened.bitcup_dir.is_dir());
+        assert!(opened.objects_dir.is_dir());
+    }
+
+    #[test]
+    fn object_store_roundtrip_blob() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("project dir");
+        let layout = init_repo(&root).expect("init");
+
+        let blob = encode_blob(b"hello store").expect("encode blob");
+        let oid = write_object(&layout, &blob).expect("write object");
+        let oid_hex = oid.to_string();
+
+        let loaded = read_object(&layout, &oid_hex)
+            .expect("read object")
+            .expect("object exists");
+        assert_eq!(loaded.kind, ObjectKind::Blob);
+        assert_eq!(loaded.object_id().to_string(), oid_hex);
+    }
+
+    #[test]
+    fn verify_detects_corrupted_object_bytes() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("project dir");
+        let layout = init_repo(&root).expect("init");
+
+        let blob = encode_blob(b"verify me").expect("encode blob");
+        let oid = write_object(&layout, &blob).expect("write object");
+        let oid_hex = oid.to_string();
+        let path = layout.objects_dir.join(&oid_hex[0..2]).join(&oid_hex[2..]);
+        let mut bytes = fs::read(&path).expect("read object file");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        fs::write(&path, bytes).expect("write corrupted bytes");
+
+        let err = verify_repo(
+            &layout,
+            VerifyOptions {
+                rebuild_index: false,
+            },
+        )
+        .expect_err("verify must fail");
+        assert!(matches!(
+            err,
+            VerifyError::Decode { .. } | VerifyError::OidMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_rebuild_index_populates_metadata_tables() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("project dir");
+        let layout = init_repo(&root).expect("init");
+
+        let blob = encode_blob(b"x").expect("blob");
+        write_object(&layout, &blob).expect("write blob");
+        let tree_oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let commit = create_commit(tree_oid, &[], "A <a@local>", "A <a@local>", "msg", 1)
+            .expect("create commit");
+        let commit_oid = write_object(&layout, &commit).expect("write commit");
+        update_ref(&layout, "refs/heads/main", &commit_oid.to_string()).expect("update ref");
+
+        let report = verify_repo(
+            &layout,
+            VerifyOptions {
+                rebuild_index: true,
+            },
+        )
+        .expect("verify");
+        assert!(report.object_count >= 2);
+        assert_eq!(report.ref_count, 1);
+
+        let metadata = MetadataStore::open(&layout).expect("open metadata");
+        let ref_cached = metadata
+            .get_ref_cache("refs/heads/main")
+            .expect("get ref cache");
+        assert_eq!(ref_cached, Some(commit_oid.to_string()));
+
+        let parents = metadata
+            .get_commit_parents(&commit_oid.to_string())
+            .expect("get commit parents");
+        assert_eq!(parents, Some(Vec::new()));
     }
 }

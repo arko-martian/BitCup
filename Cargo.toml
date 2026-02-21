@@ -22,3 +22,4 @@ bytecheck = "0.8"
 redb = "2"
 ignore = "0.4"
 fd-lock = "4"
+clap = { version = "4", features = ["derive"] }
